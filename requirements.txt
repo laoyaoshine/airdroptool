@@ -1,0 +1,11 @@
+selenium
+web3.py
+faker
+requests
+aiohttp
+websocket-client
+boto3
+google-cloud-compute
+google-cloud-storage
+google-cloud-run
+tkinter
