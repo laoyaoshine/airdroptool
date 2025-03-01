@@ -14,7 +14,6 @@ import time
 import pyautogui
 import win32gui
 import win32con
-import win32com.client
 import threading
 from selenium.webdriver.common.keys import Keys
 from pynput import mouse, keyboard
@@ -22,15 +21,11 @@ from selenium.webdriver.common.action_chains import ActionChains
 from selenium.webdriver.common.by import By
 import queue
 import requests
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException
 
 # 设置日志配置
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
-# 获取当前脚本所在的目录
 current_dir = os.path.dirname(os.path.abspath(__file__))
 icon_dir = os.path.join(current_dir, "..", "icon")
 
@@ -38,46 +33,42 @@ class ChromeManager:
     def __init__(self, num_instances: int = 5):
         self.num_instances = min(num_instances, 25)
         self.proxy_manager = ProxyManager()
-        self.instances = {}
+        self.instances = []
         self.selected_instances = []
-        self.sync_active = True
+        self.sync_active = False
+        self.main_instance = None  # 用于存储主浏览器实例
         self.check_system_resources()
         self.last_click_time = 0
-        self.click_debounce_interval = 0.5
-        self.last_click_pos = None
-        self.mouse_listener = None
-        self.keyboard_listener = None
-        self.mouse_pressed = False
-        self.mouse_pressed_button = None
+        self.click_debounce_interval = 0.2
+        self.last_click_event = None
         self.event_queue = queue.Queue()
-        self.last_released_keys = set()  # 用于跟踪已释放的按键，避免重复
-        self.last_click_position = None  # 用于跟踪上一个点击位置
+        self.last_released_keys = set()
+        self.last_key_time = 0
+        self.key_debounce_interval = 0.1  # 100ms
         self.special_keys = {
-            'ctrl': 'Control',
-            'shift': 'Shift',
-            'alt': 'Alt',
-            'backspace': 'Backspace',
-            'enter': 'Enter',
-            # 添加其他特殊按键的映射
+            'space': Keys.SPACE,
+            'enter': Keys.RETURN,
+            'backspace': Keys.BACKSPACE,
+            'tab': Keys.TAB,
+            'esc': Keys.ESCAPE,
+            'delete': Keys.DELETE,
+            'shift': Keys.SHIFT,
+            'ctrl': Keys.CONTROL,
+            'alt': Keys.ALT,
+            'cmd': Keys.COMMAND
         }
-        self.last_pressed_state = False
-        self.last_pressed_key = None
-        self.current_instance = None  # 用于存储当前活动实例
+        self.main_browser_hwnd = None  # 用于标记主浏览器
 
     def check_system_resources(self):
         cpu_usage = psutil.cpu_percent()
         memory = psutil.virtual_memory()
         if cpu_usage > 80 or memory.percent > 90:
-            log("Warning: System resources are low (CPU > 80% or Memory > 90%). Limiting instances.")
+            log("Warning: System resources low. Limiting instances.")
             self.num_instances = min(self.num_instances, 2)
 
     def validate_proxy(self, proxy: str) -> bool:
-        """验证代理是否有效"""
         try:
-            proxies = {
-                "http": f"http://{proxy}",
-                "https": f"https://{proxy}",
-            }
+            proxies = {"http": f"http://{proxy}", "https": f"https://{proxy}"}
             response = requests.get("https://www.google.com", proxies=proxies, timeout=5)
             return response.status_code == 200
         except Exception as e:
@@ -110,21 +101,9 @@ class ChromeManager:
                 options.add_argument("--no-first-run")
                 options.add_argument("--no-default-browser-check")
                 options.add_argument("--ignore-certificate-errors")
-                options.add_argument("--ignore-ssl-errors")
-                options.add_argument("--allow-insecure-localhost")
-                options.add_argument("--disable-web-security")
-                options.add_argument("--disable-extensions")
                 options.add_argument("--disable-gpu")
-                options.add_argument("--no-sandbox")
-                options.add_argument("--disable-dev-shm-usage")
-                options.add_argument("--allow-running-insecure-content")
-                options.add_argument("--ignore-certificate-errors-spki-list")
-                options.add_experimental_option("excludeSwitches", ["enable-logging"])
-                options.add_argument("--disable-background-networking")
-                options.add_argument("--disable-sync")
-                port = 9222 + i
-                options.add_argument(f"--remote-debugging-port={port}")
-                user_data_dir = os.path.join(current_dir, f"profile_no_proxy_{i}_{int(time.time())}")
+                options.add_argument("--remote-debugging-port={}".format(9222 + i))
+                user_data_dir = os.path.join(os.getcwd(), f"profile_no_proxy_{i}_{int(time.time())}")
                 options.add_argument(f"user-data-dir={user_data_dir}")
 
                 service = Service(ChromeDriverManager().install())
@@ -133,32 +112,33 @@ class ChromeManager:
                 try:
                     driver = webdriver.Chrome(service=service, options=options)
                     driver.get("about:blank")
+                    hwnd = self.get_chrome_window_handle(driver)
+                    if hwnd:
+                        self.instances.append({"driver": driver, "hwnd": hwnd, "user_data_dir": user_data_dir, "proxy": None})
+                        logger.info(f"Started Chrome instance {i} on hwnd {hwnd}")
+                        
+                        # 设置第一个实例为主浏览器
+                        if i == 0:
+                            self.main_instance = self.instances[-1]
+                    else:
+                        logger.error(f"Failed to get window handle for instance {i}, skipping...")
+                        driver.quit()
+                        continue
+                    
+                    if batch_open_urls:
+                        for url in batch_open_urls:
+                            driver.get(url)
+                            logger.info(f"Opened URL {url} in instance {i}")
+                    
+                    tasks.append(asyncio.sleep(1))
+                
                 except Exception as e:
-                    log(f"Failed to start Chrome instance {i} on port {port}: {e}")
-                    continue
+                    logger.error(f"Error starting Chrome instances: {e}")  # 处理异常
                 
-                time.sleep(3)
-                
-                hwnd = self.get_chrome_window_handle(driver)
-                if hwnd:
-                    self.instances[i] = {"driver": driver, "proxy": None, "user_data_dir": user_data_dir, "hwnd": hwnd, "port": port}
-                    log(f"Started instance {i} without proxy on port {port}")
-                else:
-                    log(f"Failed to get window handle for instance {i}, skipping...")
-                    driver.quit()
-                    continue
-                
-                if batch_open_urls:
-                    for url in batch_open_urls:
-                        driver.get(url)
-                        log(f"Opened URL {url} in instance {i}")
-                
-                tasks.append(asyncio.sleep(1))
-            
             await asyncio.gather(*tasks)
             self.arrange_windows()
         except Exception as e:
-            handle_error(e, "Starting Chrome instances without proxy")
+            logger.error(f"Error starting Chrome instances: {e}")  # 处理异常
 
     async def start_instances_with_proxy(self, valid_proxies: list, batch_open_urls: list = None):
         tasks = []
@@ -172,13 +152,13 @@ class ChromeManager:
                 options.add_argument("--disable-dev-shm-usage")
                 options.add_argument("--disable-gpu")
                 options.add_argument("--disable-infobars")
+                options.add_argument("--disable-infobars")
                 options.add_argument("--ignore-ssl-errors")
                 options.add_argument("--allow-running-insecure-content")
                 options.add_argument("--ignore-certificate-errors-spki-list")
-                options.add_argument("--disable-background-networking")
-                options.add_argument("--disable-sync")
                 options.add_experimental_option("excludeSwitches", ["enable-logging"])
-                options.add_argument(f"--remote-debugging-port={9222 + i}")
+                port = 9222 + i
+                options.add_argument(f"--remote-debugging-port={port}")
                 fingerprint = generate_fingerprint()
                 options.add_argument(f"user-agent={fingerprint['user_agent']}")
                 user_data_dir = os.path.join(current_dir, f"profile_proxy_{i}_{int(time.time())}")
@@ -188,8 +168,8 @@ class ChromeManager:
                 driver.get("about:blank")
                 hwnd = self.get_chrome_window_handle(driver)
                 if hwnd:
-                    self.instances[i] = {"driver": driver, "proxy": proxy, "user_data_dir": user_data_dir, "hwnd": hwnd, "port": 9222 + i}
-                    log(f"Started instance {i} with proxy {proxy}")
+                    self.instances.append({"driver": driver, "proxy": proxy, "user_data_dir": user_data_dir, "hwnd": hwnd})
+                    log(f"Started Chrome instance {i} with proxy {proxy}")
                 else:
                     log(f"Failed to get window handle for instance {i}, skipping...")
                     driver.quit()
@@ -206,50 +186,32 @@ class ChromeManager:
 
     def get_chrome_window_handle(self, driver):
         try:
-            max_attempts = 5
-            for attempt in range(max_attempts):
-                hwnd = win32gui.FindWindow("Chrome_WidgetWin_1", None)
-                if hwnd and win32gui.IsWindowVisible(hwnd):
-                    return hwnd
-                log(f"Attempt {attempt + 1}/{max_attempts} to get window handle failed, retrying...")
-                time.sleep(2)
-            log("Failed to get Chrome window handle after multiple attempts")
-            return None
+            hwnd = win32gui.FindWindow("Chrome_WidgetWin_1", None)
+            return hwnd if hwnd else None
         except Exception as e:
-            log(f"Error getting Chrome window handle: {e}")
+            logger.error(f"Error getting Chrome window handle: {e}")
             return None
 
-    def arrange_windows(self, custom_layout=None):
+    def arrange_windows(self):
+        """排列所有浏览器窗口"""
         if not self.instances:
-            log("No instances available to arrange")
             return
 
-        screen_width, screen_height = pyautogui.size()
+        screen_width = 1920  # 假设屏幕宽度
+        screen_height = 1080  # 假设屏幕高度
         num_instances = len(self.instances)
 
-        if custom_layout:
-            for i, instance in enumerate(self.instances.values()):
-                if i < len(custom_layout) and instance["hwnd"]:
-                    x, y, width, height = custom_layout[i]
-                    win32gui.MoveWindow(instance["hwnd"], x, y, width, height, True)
-                    log(f"Arranged instance {i} at custom position ({x}, {y}) with size ({width}, {height})")
-        else:
-            if num_instances == 5:
-                cols = 5
-                rows = 1
-            else:
-                cols = min(int((num_instances ** 0.5) + 0.5), 5)
-                rows = (num_instances + cols - 1) // cols
+        # 计算每个窗口的宽度和高度
+        window_width = screen_width // num_instances
+        window_height = screen_height // 2  # 假设每个窗口的高度为屏幕高度的一半
 
-            width = screen_width // cols
-            height = screen_height // rows
-
-            for i, instance in self.instances.items():
-                if instance["hwnd"]:
-                    x = (i % cols) * width
-                    y = (i // cols) * height
-                    win32gui.MoveWindow(instance["hwnd"], x, y, width, height, True)
-                    log(f"Arranged instance {i} at grid position ({x}, {y}) with size ({width}, {height})")
+        for index, instance in enumerate(self.instances):
+            hwnd = instance["hwnd"]
+            if hwnd and win32gui.IsWindow(hwnd):
+                x_position = index * window_width
+                y_position = 0  # 可以根据需要调整
+                win32gui.MoveWindow(hwnd, x_position, y_position, window_width, window_height, True)
+                logger.info(f"Arranged window {hwnd} to position ({x_position}, {y_position})")
 
     def batch_open_url(self, urls: list = None):
         if urls is None or not urls:
@@ -266,16 +228,16 @@ class ChromeManager:
             messagebox.showwarning("警告", "请先启动实例")
             return
 
-        for instance_id, instance_info in self.instances.items():
+        for instance in self.instances:
             try:
                 for url in urls:
                     if not url.startswith(('http://', 'https://')):
                         url = 'https://' + url
-                    instance_info["driver"].get(url)
-                    log(f"Opened URL {url} in instance {instance_id} with proxy {instance_info['proxy'] or 'None'}")
+                    instance["driver"].get(url)
+                    log(f"Opened URL {url} in instance with proxy {instance['proxy'] or 'None'}")
                     time.sleep(0.5)
             except Exception as e:
-                handle_error(e, f"Opening URL {url} in instance {instance_id}")
+                handle_error(e, f"Opening URL {url} in instance")
 
     def select_instances(self, instance_ids: list):
         self.selected_instances = [inst for i, inst in enumerate(self.instances) if i in instance_ids]
@@ -285,23 +247,25 @@ class ChromeManager:
         tasks = []
         try:
             instances_to_stop = self.instances if instance_ids is None else [inst for i, inst in enumerate(self.instances) if i in instance_ids]
-            for instance_id, instance_info in instances_to_stop.items():
+            for instance in instances_to_stop:
                 try:
-                    instance_info["driver"].get("about:blank")
+                    instance["driver"].get("about:blank")
                     time.sleep(1)
-                    instance_info["driver"].quit()
+                    instance["driver"].quit()
                 except Exception as e:
-                    log(f"Error quitting instance {instance_info['hwnd']}: {e}")
-                if os.path.exists(instance_info["user_data_dir"]):
+                    log(f"Error quitting instance {instance['hwnd']}: {e}")
+                    if "Connection refused" in str(e):
+                        logger.warning(f"Connection refused for instance {instance['hwnd']}, retrying...")
+                if os.path.exists(instance["user_data_dir"]):
                     import shutil
-                    shutil.rmtree(instance_info["user_data_dir"], ignore_errors=True)
-                log(f"Stopped Chrome instance with proxy {instance_info['proxy'] or 'None'}")
+                    shutil.rmtree(instance["user_data_dir"], ignore_errors=True)
+                log(f"Stopped Chrome instance with proxy {instance.get('proxy', 'None')}")
                 tasks.append(asyncio.sleep(0.5))
             await asyncio.gather(*tasks)
             if instance_ids is None:
                 self.instances.clear()
             else:
-                self.instances = {i: inst for i, inst in enumerate(self.instances) if i not in instance_ids}
+                self.instances = [inst for i, inst in enumerate(self.instances) if i not in instance_ids]
         except Exception as e:
             handle_error(e, "Stopping Chrome instances")
 
@@ -320,204 +284,196 @@ class ChromeManager:
             messagebox.showwarning("警告", "同步已在运行")
             return
         
-        valid_instances = []
-        for instance_id, instance_info in self.instances.items():
-            try:
-                if instance_info["driver"].session_id:
-                    instance_info["driver"].execute_script("window.focus();")
-                    win32gui.SetForegroundWindow(instance_info["hwnd"])
-                    valid_instances.append(instance_info)
-                else:
-                    log(f"Instance {instance_info['hwnd']} has invalid session, removing...")
-            except Exception as e:
-                log(f"Failed to validate instance {instance_info['hwnd']}: {e}")
-        
-        if not valid_instances:
-            messagebox.showwarning("警告", "所有实例均无效，请重新启动实例")
-            return
-
         self.sync_active = True
-        self.selected_instances = valid_instances
-        self.event_queue = queue.Queue()
-        self.current_instance = self.selected_instances[0] if self.selected_instances else None  # 设置当前实例
 
-        self.sync_thread = threading.Thread(target=self.sync_worker, daemon=True)
-        self.sync_thread.start()
+        # 启动鼠标和键盘监听器
+        self.mouse_listener = mouse.Listener(on_click=self.on_mouse_click)
+        self.keyboard_listener = keyboard.Listener(on_press=self.on_key_press)
+        
+        self.mouse_listener.start()
+        self.keyboard_listener.start()
+        logger.info("Started mouse and keyboard synchronization for selected instances")
+        
+        # 使用一个新的线程来处理对话框
+        threading.Thread(target=self.show_sync_message).start()
 
-        try:
-            self.mouse_listener = mouse.Listener(on_click=self.on_mouse_click_wrapper)
-            self.keyboard_listener = keyboard.Listener(on_press=self.on_key_press_wrapper)
-            
-            self.mouse_listener.start()
-            self.keyboard_listener.start()
-            log("Started mouse and keyboard synchronization for selected instances")
-            messagebox.showinfo("同步", "已开始同步所有实例")
-        except Exception as e:
-            log(f"Failed to start listeners: {e}")
-            self.stop_sync()
+    def show_sync_message(self):
+        # 使用一个新的线程来显示对话框
+        threading.Thread(target=self._show_sync_message).start()
+
+    def _show_sync_message(self):
+        # 显示同步对话框
+        messagebox.showinfo("同步", "已开始同步所有实例")
 
     def stop_sync(self):
-        if self.sync_active:
-            self.sync_active = False
-            if self.mouse_listener:
-                self.mouse_listener.stop()
-            if self.keyboard_listener:
-                self.keyboard_listener.stop()
-            if hasattr(self, 'sync_thread') and self.sync_thread.is_alive():
-                self.sync_thread.join(timeout=2)
-            messagebox.showinfo("同步", "已停止同步")
-            log("Synchronization stopped")
+        self.sync_active = False
+        if self.mouse_listener:
+            self.mouse_listener.stop()
+        if self.keyboard_listener:
+            self.keyboard_listener.stop()
+        logger.info("Stopped synchronization")
+        # 显示可关闭的消息框，并在一定时间后自动关闭
+        messagebox.showinfo("同步", "已停止同步所有实例")
+        root = tk.Tk()
+        root.withdraw()
+        root.after(3000, root.destroy)  # 3秒后自动关闭
+        root.mainloop()
+
+    def on_mouse_click(self, x, y, button, pressed):
+        if not self.main_instance:
+            return
+        
+        driver = self.main_instance["driver"]
+        hwnd = self.main_instance["hwnd"]
+        
+        if hwnd and win32gui.IsWindow(hwnd):  # 检查窗口句柄是否有效
+            try:
+                # 仅在主浏览器上设置前景窗口
+                if win32gui.GetForegroundWindow() == hwnd:
+                    # 获取浏览器窗口的大小和位置
+                    rect = win32gui.GetWindowRect(hwnd)
+                    window_x, window_y, window_width, window_height = rect
+                    
+                    # 确保点击坐标在窗口范围内
+                    if window_x <= x <= window_x + window_width and window_y <= y <= window_y + window_height:
+                        actions = ActionChains(driver)
+                        actions.move_by_offset(x - window_x, y - window_y).click().perform()  # 计算相对坐标
+                        actions.reset_actions()
+                        logger.info(f"Synchronized click to main instance {hwnd} at ({x}, {y})")
+
+                        # 同步到其他浏览器，跳过主浏览器
+                        for instance in self.instances:
+                            if instance["hwnd"] != hwnd:  # 只同步到其他浏览器
+                                self.sync_click_to_instance(instance, x - window_x, y - window_y, button, pressed)
+            except Exception as e:
+                logger.error(f"Failed to sync click to instance {hwnd}: {e}")
         else:
-            messagebox.showwarning("警告", "没有正在运行的同步")
+            logger.error(f"Invalid window handle for main instance.")
 
-    def sync_worker(self):
-        while self.sync_active:
-            try:
-                event = self.event_queue.get(timeout=0.1)
-                log(f"Processing event: {event}")  # 添加日志以查看事件
-                if event["type"] == "mouse_click":
-                    for instance_id, instance in self.instances.items():  # 遍历所有实例
-                        self.on_mouse_click(event["x"], event["y"], event["button"], event["pressed"], instance)
-                elif event["type"] == "key_press":
-                    for instance_id, instance in self.instances.items():  # 遍历所有实例
-                        self.on_key_press(event["key"], instance)
-                self.event_queue.task_done()  # 确保任务完成
-            except queue.Empty:
-                continue
-            except Exception as e:
-                log(f"Sync worker error: {e}")
-                continue
-
-    def is_browser_active(self, browser_type="chrome"):
-        """检查当前活动窗口是否为指定浏览器"""
-        active_window = win32gui.GetForegroundWindow()
-        if not active_window:
-            return False
-        class_name = win32gui.GetClassName(active_window)
-        if browser_type == "chrome":
-            return "Chrome_WidgetWin_1" in class_name
-        elif browser_type == "firefox":
-            return "MozillaWindowClass" in class_name  # Firefox 窗口类名
-        return False
-
-    def get_active_element_type(self, driver):
-        """确定当前焦点元素是地址栏还是搜索框"""
+    def sync_click_to_instance(self, instance, x, y, button, pressed):
         try:
-            # 尝试找到地址栏（Chrome 导航栏）
-            address_bar = driver.find_element(By.ID, "url")
-            if address_bar.is_displayed() and address_bar.is_enabled():
-                return "address_bar"
-
-            # 尝试找到搜索框（如 Google 搜索框）
-            search_box = driver.find_element(By.NAME, "q")
-            if search_box.is_displayed() and search_box.is_enabled():
-                return "search_box"
-
-            # 默认返回 None，表示非输入区域
-            return None
-        except Exception:
-            return None
-
-    def on_mouse_click_wrapper(self, x, y, button, pressed):
-        """鼠标点击事件的包装器，将事件放入队列"""
-        if not self.sync_active or not self.is_browser_active():
-            log("操作不在浏览器内，跳过点击同步")
-            return
-        log(f"Mouse click captured: x={x}, y={y}, button={button}, pressed={pressed}")
-        self.event_queue.put({"type": "mouse_click", "x": x, "y": y, "button": button, "pressed": pressed})
-
-    def on_key_press_wrapper(self, key):
-        """键盘按下事件的包装器，传递当前实例"""
-        if self.current_instance:
-            self.on_key_press(key, self.current_instance)
-
-    def on_mouse_click(self, x, y, button, pressed, instance):
-        """处理鼠标点击事件并同步到所有实例"""
-        if not self.sync_active or not self.is_browser_active():
-            log("操作不在浏览器内，跳过点击同步")
-            return
-
-        driver = instance["driver"]
-        try:
-            # 获取当前活动窗口的边界
-            active_window = win32gui.GetForegroundWindow()
-            window_rect = win32gui.GetWindowRect(active_window)
-            log(f"浏览器窗口边界: {window_rect}")  # 添加日志以查看窗口边界
-
-            # 检查点击位置是否在窗口范围内
-            if not (window_rect[0] <= x <= window_rect[2] and window_rect[1] <= y <= window_rect[3]):
-                log(f"Skipping click sync: position ({x}, {y}) is outside window bounds")
-                return
-
-            driver.execute_script("window.focus();")
-            element = driver.execute_script(f"return document.elementFromPoint({x}, {y});")
-            if element is not None:
-                element.click()  # 点击指定位置
-                log(f"Synchronized click at ({x}, {y}) to instance {instance['hwnd']}")
-            else:
-                log(f"Failed to find element at ({x}, {y}) for instance {instance['hwnd']}")
-        except Exception as e:
-            log(f"Failed to sync click to instance {instance['hwnd']}: {e}")
-
-    def on_mouse_scroll(self, x, y, dx, dy):
-        if not self.sync_active or not self.is_browser_active():
-            return
-        
-        active_window = win32gui.GetForegroundWindow()
-        window_rect = win32gui.GetWindowRect(active_window)
-        if not (window_rect[0] <= x <= window_rect[2] and window_rect[1] <= y <= window_rect[3]):
-            log(f"Skipping scroll sync: mouse position ({x}, {y}) is outside Chrome window bounds {window_rect}")
-            return
-        
-        for instance in self.selected_instances:
             driver = instance["driver"]
-            try:
-                # 聚焦当前实例并切换到活动标签页
-                driver.execute_script("window.focus();")
-                win32gui.SetForegroundWindow(instance["hwnd"])
-                for handle in driver.window_handles:
-                    driver.switch_to.window(handle)
-                    driver.execute_script("window.focus();")
+            hwnd = instance["hwnd"]
+            # 不设置前景窗口，只执行点击操作
+            actions = ActionChains(driver)
+            actions.move_by_offset(x, y).click().perform()
+            actions.reset_actions()
+            log(f"Synchronized click to instance {hwnd} at ({x}, {y})")
+        except Exception as e:
+            log(f"Failed to sync click to instance {hwnd}: {e}")
 
-                scroll_amount = dy * 100
-                driver.execute_script(f"window.scrollBy(0, {scroll_amount});")
-                log(f"Synchronized scroll to instance {instance['hwnd']} by {scroll_amount} pixels")
-            except Exception as e:
-                log(f"Failed to sync scroll to instance {instance['hwnd']}: {e}")
-
-    def on_key_press(self, key, instance):
-        """处理键盘按下事件并同步到所有实例"""
-        if not self.sync_active:
+    def on_key_press(self, key):
+        if not self.main_instance:
             return
-
-        for inst_id, inst in self.instances.items():  # 遍历所有实例
-            driver = inst["driver"]
+        
+        driver = self.main_instance["driver"]
+        hwnd = self.main_instance["hwnd"]
+        
+        if hwnd and win32gui.IsWindow(hwnd):  # 检查窗口句柄是否有效
             try:
-                # 获取按键字符或名称
-                key_char = key.char if hasattr(key, 'char') else str(key).replace("Key.", "")
-                log(f"Key pressed: {key_char}")  # 添加日志以查看按键
+                # 仅在主浏览器上设置前景窗口
+                if win32gui.GetForegroundWindow() == hwnd:
+                    key_str = str(key)  # 将 KeyCode 转换为字符串
+                    
+                    # 跳过地址栏聚焦键（如 F6）
+                    if key_str in ['Key.f6', 'Key.tab']:
+                        return
+                    
+                    driver.switch_to.active_element.send_keys(key_str)  # 只在主浏览器中输入
+                    logger.info(f"Synchronized key press {key_str} to main instance {hwnd}")
 
-                # 发送键盘输入
-                driver.execute_script("window.focus();")
-                driver.execute_script(f"document.activeElement.value += '{key_char}';")  # 发送按键
-                log(f"Synchronized key {key_char} to instance {inst['hwnd']}")
+                    # 同步到其他浏览器
+                    for instance in self.instances:
+                        if instance["hwnd"] != hwnd:  # 只同步到其他浏览器
+                            self.sync_key_to_instance(instance, key_str)  # 确保同步所有按键，包括回车
             except Exception as e:
-                log(f"Failed to sync key {key_char} to instance {inst['hwnd']}: {e}")
+                logger.error(f"Failed to send key {key} to main instance {hwnd}: {e}")
+        else:
+            logger.error(f"Invalid window handle for main instance.")
+
+    def sync_key_to_instance(self, instance, key):
+        try:
+            driver = instance["driver"]
+            hwnd = instance["hwnd"]
+            # 不设置前景窗口，只执行键入操作
+            driver.switch_to.active_element.send_keys(key)
+            log(f"Synchronized key press {key} to instance {hwnd}")
+        except Exception as e:
+            log(f"Failed to sync key {key} to instance {hwnd}: {e}")
 
     def on_key_release(self, key):
-        """处理键盘释放事件"""
         if not self.sync_active:
             return
+        
+        current_time = time.time()
+        if current_time - self.last_key_time < self.key_debounce_interval:
+            return
+        
+        key_char = key.char if hasattr(key, 'char') else str(key).replace("Key.", "")
+        if not key_char or key_char == "None":
+            return
+        
+        if key_char in self.last_released_keys:
+            return
+        
+        self.last_key_time = current_time
+        self.last_released_keys.add(key_char)
+        active_window = win32gui.GetForegroundWindow()
+        self.main_browser_hwnd = active_window  # 标记主浏览器
+        self.event_queue.put({"type": "key_release", "key": key_char, "hwnd": active_window})
+        log(f"Key released: {key_char} on main browser {active_window}")
 
-        if key in self.last_released_keys:
-            return  # 如果按键已经处理过，则跳过
+    def sync_mouse_click(self, x, y, button, pressed, main_hwnd):
+        for instance in self.selected_instances:
+            try:
+                driver = instance["driver"]
+                hwnd = instance["hwnd"]
+                if hwnd == main_hwnd:  # 跳过主浏览器
+                    continue
+                win32gui.SetForegroundWindow(hwnd)
+                for handle in driver.window_handles:
+                    driver.switch_to.window(handle)
+                    actions = ActionChains(driver)
+                    actions.move_by_offset(x, y).click().perform()
+                    actions.reset_actions()
+                log(f"Synchronized click to instance {hwnd} at ({x}, {y})")
+            except Exception as e:
+                log(f"Failed to sync click to instance {hwnd}: {e}")
 
-        self.last_released_keys.add(key)  # 记录已释放的按键
-        print(f"Key released: {key}")  # 记录按键释放事件
+    def sync_mouse_scroll(self, x, y, dx, dy, main_hwnd):
+        for instance in self.selected_instances:
+            try:
+                driver = instance["driver"]
+                hwnd = instance["hwnd"]
+                if hwnd == main_hwnd:  # 跳过主浏览器
+                    continue
+                win32gui.SetForegroundWindow(hwnd)
+                for handle in driver.window_handles:
+                    driver.switch_to.window(handle)
+                    driver.execute_script(f"window.scrollBy({dx * 100}, {dy * 100});")
+                log(f"Synchronized scroll to instance {hwnd} by dx={dx*100}, dy={dy*100}")
+            except Exception as e:
+                log(f"Failed to sync scroll to instance {hwnd}: {e}")
 
-    def reset_key_tracking(self):
-        """重置已释放的按键跟踪"""
-        self.last_released_keys.clear()  # 清空已释放的按键记录
+    def sync_key(self, key, action, main_hwnd):
+        for instance in self.selected_instances:
+            try:
+                driver = instance["driver"]
+                hwnd = instance["hwnd"]
+                if hwnd == main_hwnd:  # 跳过主浏览器
+                    continue
+                win32gui.SetForegroundWindow(hwnd)
+                for handle in driver.window_handles:
+                    driver.switch_to.window(handle)
+                    element = driver.switch_to.active_element
+                    if action == "press":
+                        if key in self.special_keys:
+                            element.send_keys(self.special_keys[key])
+                        else:
+                            element.send_keys(key)
+                        log(f"Synchronized key press {key} to instance {hwnd}")
+            except Exception as e:
+                log(f"Failed to sync key {key} to instance {hwnd}: {e}")
 
     def show_gui(self):
         root = tk.Tk()
